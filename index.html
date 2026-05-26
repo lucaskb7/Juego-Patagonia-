@@ -1,0 +1,445 @@
+
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0d0400}
+#gr{width:1080px;height:1080px;position:relative;overflow:hidden;margin:0 auto}
+#gc{display:block;width:1080px;height:1080px}
+#controls{position:absolute;bottom:24px;left:50%;transform:translateX(-50%);display:flex;gap:20px;z-index:10}
+.cb{background:rgba(80,30,5,0.85);color:#f5deb3;border:2px solid #c0722a;border-radius:12px;padding:18px 48px;font-size:26px;cursor:pointer;font-family:Georgia,serif;font-weight:bold;transition:background .15s,transform .08s;user-select:none}
+.cb:active{background:#a0520a;transform:scale(.94)}
+#hint{position:absolute;bottom:110px;left:50%;transform:translateX(-50%);color:#c09060;font-size:15px;font-family:Georgia,serif;white-space:nowrap;text-align:center}
+</style>
+<div id="gr">
+  <canvas id="gc"></canvas>
+  <div id="hint">Espacio / ↑ = saltar &nbsp;·&nbsp; ↓ = agacharse &nbsp;·&nbsp; Las rocas te frenan y el fuego se acerca</div>
+  <div id="controls">
+    <button class="cb" id="bJ">↑ Saltar</button>
+    <button class="cb" id="bC">↓ Agachar</button>
+  </div>
+</div>
+<script>
+const cv=document.getElementById('gc');
+const cx=cv.getContext('2d');
+const W=1080,H=1080;
+cv.width=W;cv.height=H;
+
+const GY=H-130;       // nivel del suelo
+const G=0.72;         // gravedad
+const JV=-17;         // impulso salto
+const BASE_SPD=4.2;   // velocidad base jugador
+const BASE_FIRE=1.6;  // velocidad base fuego
+
+let st='start',cN=3,cT=0,raf=null,last=0;
+let pl,fire,obs,cam,trees,goalX,slowF,muzzA;
+const keys={};
+
+/* ── Audio ── */
+let actx=null;
+function initAudio(){
+  if(actx)return;
+  actx=new(window.AudioContext||window.webkitAudioContext)();
+  crackle();
+}
+function crackle(){
+  if(!actx){setTimeout(crackle,400);return;}
+  if(st!=='playing'){setTimeout(crackle,400);return;}
+  const dur=0.05+Math.random()*0.07;
+  const buf=actx.createBuffer(1,Math.floor(actx.sampleRate*dur),actx.sampleRate);
+  const d=buf.getChannelData(0);
+  for(let i=0;i<d.length;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/d.length,1.6);
+  const src=actx.createBufferSource();src.buffer=buf;
+  const f=actx.createBiquadFilter();f.type='bandpass';f.frequency.value=1600+Math.random()*1400;f.Q.value=0.9;
+  const g=actx.createGain();g.gain.value=0.22+Math.random()*0.25;
+  src.connect(f);f.connect(g);g.connect(actx.destination);
+  src.start();src.stop(actx.currentTime+dur);
+  setTimeout(crackle,50+Math.random()*180);
+}
+
+function initLv(){
+  goalX=W*3.8;cam={x:0};slowF=0;muzzA=0;
+  pl={x:100,y:GY-70,w:36,h:70,vy:0,onG:true,cr:false,spd:BASE_SPD};
+  fire={x:-120,w:110};
+  obs=[];
+  const slots=[380,680,1000,1340,1700,2080,2460,2860,3240];
+  slots.forEach(sx=>{
+    const h=52;
+    obs.push({x:sx+Math.random()*80,w:70,h,y:GY-h});
+  });
+  trees=[];
+  for(let i=0;i<32;i++)
+    trees.push({x:60+i*145+Math.random()*60,h:120+Math.random()*90,burn:false,ph:Math.random()*Math.PI*2});
+}
+
+/* Input */
+window.addEventListener('keydown',e=>{
+  keys[e.code]=true;
+  if(['Space','ArrowUp','ArrowDown'].includes(e.code))e.preventDefault();
+  if(st==='start'||st==='dead'||st==='win')startCD();
+});
+window.addEventListener('keyup',e=>{keys[e.code]=false;});
+cv.addEventListener('click',()=>{initAudio();if(st==='start'||st==='dead'||st==='win')startCD();});
+
+function btn(id,code){
+  const el=document.getElementById(id);
+  ['mousedown','touchstart'].forEach(ev=>
+    el.addEventListener(ev,e=>{e.preventDefault();initAudio();keys[code]=true;},{passive:false}));
+  ['mouseup','touchend','mouseleave','touchcancel'].forEach(ev=>
+    el.addEventListener(ev,e=>{e.preventDefault();keys[code]=false;},{passive:false}));
+}
+btn('bJ','Space');btn('bC','ArrowDown');
+
+function startCD(){
+  if(st==='countdown')return;
+  st='countdown';cN=3;cT=0;initLv();
+  if(!raf){last=performance.now();raf=requestAnimationFrame(loop);}
+}
+
+function loop(ts){
+  const dt=Math.min(ts-last,50);last=ts;
+  if(st==='countdown')updCD(dt);
+  else if(st==='playing')updGame();
+  draw();
+  raf=requestAnimationFrame(loop);
+}
+function updCD(dt){cT+=dt;if(cT>900){cT=0;cN--;if(cN<=0)st='playing';}}
+
+function updGame(){
+  pl.cr=!!keys['ArrowDown'];
+  const ph=pl.h;
+  pl.h=pl.cr?38:70;
+  if(ph!==pl.h)pl.y=GY-pl.h;
+
+  /* recuperar velocidad si no está frenado */
+  if(slowF>0){slowF--;pl.spd=BASE_SPD*0.4;}
+  else pl.spd=Math.min(BASE_SPD,pl.spd+0.06);
+
+  pl.x+=pl.spd;
+  if((keys['Space']||keys['ArrowUp'])&&pl.onG){pl.vy=JV;pl.onG=false;}
+  pl.vy+=G;pl.y+=pl.vy;
+  if(pl.y>=GY-pl.h){pl.y=GY-pl.h;pl.vy=0;pl.onG=true;}
+  else pl.onG=false;
+
+  cam.x=Math.max(0,pl.x-W*0.28);
+
+  /* ── Fuego perseguidor ──
+     velocidad base + bono proporcional a la distancia (se acerca si el jugador se frenó) */
+  const gap=pl.x-(fire.x+fire.w);          // distancia entre frente fuego y jugador
+  const closingBonus=Math.max(0,(300-gap)/300)*2.8; // más rápido cuanto más lejos está el jugador
+  const fireSpd=BASE_FIRE+closingBonus+(slowF>0?1.6:0);
+  fire.x+=fireSpd;
+
+  trees.forEach(t=>{if(fire.x+fire.w>t.x)t.burn=true;});
+
+  /* rocas: frena, no mata */
+  obs.forEach(ob=>{
+    if(ovlp(pl,ob)){
+      const fromTop=pl.vy>=0&&pl.y+pl.h<=ob.y+ob.h*0.45+10;
+      if(fromTop){pl.y=ob.y-pl.h;pl.vy=0;pl.onG=true;}
+      else slowF=40;
+    }
+  });
+
+  if(fire.x+fire.w>=pl.x+6){st='dead';return;}
+  if(pl.x>=goalX){st='win';return;}
+}
+
+function ovlp(a,b){
+  return a.x<b.x+b.w&&a.x+a.w>b.x&&a.y<b.y+b.h&&a.y+a.h>b.y;
+}
+
+/* ══ DRAW ══ */
+function draw(){
+  cx.clearRect(0,0,W,H);
+  if(st==='start'){drawStart();return;}
+  drawScene();
+  if(st==='countdown'){drawCD();return;}
+  if(st==='dead')drawOverlay('#8a1200','El fuego te alcanzó','El bosque no espera. Clic para reintentar.');
+  if(st==='win')drawWin();
+}
+
+function drawStart(){
+  /* fondo */
+  const bg=cx.createLinearGradient(0,0,0,H);
+  bg.addColorStop(0,'#100300');bg.addColorStop(0.6,'#400e00');bg.addColorStop(1,'#180500');
+  cx.fillStyle=bg;cx.fillRect(0,0,W,H);
+  /* árboles silhouette */
+  for(let i=0;i<10;i++){
+    cx.fillStyle=`rgba(20,8,0,${0.5+i*0.04})`;
+    const tx=50+i*110;
+    cx.beginPath();cx.moveTo(tx,H*0.75);cx.lineTo(tx-35,H);cx.lineTo(tx+35,H);cx.closePath();cx.fill();
+    cx.beginPath();cx.moveTo(tx,H*0.55);cx.lineTo(tx-28,H*0.76);cx.lineTo(tx+28,H*0.76);cx.closePath();cx.fill();
+    cx.beginPath();cx.moveTo(tx,H*0.38);cx.lineTo(tx-20,H*0.56);cx.lineTo(tx+20,H*0.56);cx.closePath();cx.fill();
+  }
+  /* brillo fuego */
+  const glow=cx.createRadialGradient(W/2,H*0.7,30,W/2,H*0.7,400);
+  glow.addColorStop(0,'rgba(255,80,0,0.35)');glow.addColorStop(1,'rgba(0,0,0,0)');
+  cx.fillStyle=glow;cx.fillRect(0,0,W,H);
+
+  cx.fillStyle='#ff6a00';cx.font='bold 72px Georgia';cx.textAlign='center';
+  cx.shadowColor='#ff3000';cx.shadowBlur=40;
+  cx.fillText('🔥 Escape del Fuego',W/2,H/2-80);
+  cx.shadowBlur=0;
+  cx.fillStyle='#d4a060';cx.font='24px Georgia';
+  cx.fillText('Escapá del incendio antes de que te alcance.',W/2,H/2-10);
+  cx.fillStyle='#ff8c42';cx.font='20px Georgia';
+  cx.fillText('Clic aquí o presioná Enter para comenzar',W/2,H/2+60);
+  cx.textAlign='left';
+}
+
+function drawScene(){
+  cx.save();cx.translate(-cam.x,0);
+
+  /* cielo */
+  const sky=cx.createLinearGradient(0,0,0,GY);
+  sky.addColorStop(0,'#1a0500');sky.addColorStop(0.45,'#6b1e00');sky.addColorStop(1,'#d04000');
+  cx.fillStyle=sky;cx.fillRect(cam.x,0,W,GY);
+
+  /* humo */
+  const smk=cx.createLinearGradient(0,0,0,GY*0.7);
+  smk.addColorStop(0,'rgba(25,8,0,0.6)');smk.addColorStop(1,'rgba(60,20,0,0)');
+  cx.fillStyle=smk;cx.fillRect(cam.x,0,W,GY*0.7);
+
+  trees.forEach(t=>drawTree(t));
+
+  /* suelo */
+  cx.fillStyle='#261000';cx.fillRect(cam.x,GY,W+cam.x+400,H-GY);
+  cx.fillStyle='#1c2e0c';cx.fillRect(cam.x,GY,W+cam.x+400,7);
+
+  /* brasas */
+  for(let i=0;i<18;i++){
+    const bx=cam.x+i*75+Math.sin(Date.now()/350+i)*10;
+    cx.fillStyle=`rgba(255,${60+i*8},0,${0.25+Math.sin(Date.now()/280+i)*0.18})`;
+    cx.beginPath();cx.arc(bx,GY+5,3+Math.random()*2,0,Math.PI*2);cx.fill();
+  }
+
+  /* meta */
+  cx.strokeStyle='#30ff70';cx.lineWidth=3.5;cx.setLineDash([14,9]);
+  cx.beginPath();cx.moveTo(goalX,0);cx.lineTo(goalX,H);cx.stroke();
+  cx.setLineDash([]);
+  if(st==='win'){drawHose();}else{
+    cx.fillStyle='#30ff70';cx.font='bold 16px Georgia';cx.fillText('ZONA SEGURA',goalX+8,28);
+  }
+
+  obs.forEach(ob=>drawRock(ob));
+  drawFire();
+  drawFirefighter();
+
+  /* barra progreso */
+  const prog=Math.min(1,pl.x/goalX);
+  const bx=cam.x+14,by=14,bw=280,bh=18;
+  cx.fillStyle='rgba(0,0,0,.55)';cx.fillRect(bx-2,by-2,bw+4,bh+4);
+  cx.fillStyle='#2a1000';cx.fillRect(bx,by,bw,bh);
+  const pg=cx.createLinearGradient(bx,0,bx+bw,0);
+  pg.addColorStop(0,'#ff2800');pg.addColorStop(1,'#38b008');
+  cx.fillStyle=pg;cx.fillRect(bx,by,bw*prog,bh);
+  cx.fillStyle='rgba(255,255,255,0.8)';cx.font='11px Georgia';
+  cx.fillText('Progreso',bx+4,by-3);
+
+  /* aviso freno */
+  if(slowF>0){
+    cx.fillStyle='rgba(255,210,0,0.92)';cx.font='bold 18px Georgia';cx.textAlign='center';
+    cx.fillText('⚠ Roca — ¡frenado! El fuego se acerca',cam.x+W/2,GY-12);
+    cx.textAlign='left';
+  }
+
+  cx.restore();
+}
+
+/* ── Árbol patagónico ── */
+function drawTree(t){
+  const tH=t.h*0.38,tx=t.x;
+  cx.fillStyle=t.burn?'#4a1000':'#3a1e06';
+  cx.fillRect(tx-7,GY-tH,14,tH);
+  if(t.burn){
+    fl(tx,GY-tH,28,t.ph);
+    fl(tx-10,GY-tH*0.7,16,t.ph+1);
+  }else{
+    /* capas de pino */
+    [[0,t.h*0.72,t.h*0.26],[0,t.h*0.5,t.h*0.33],[0,t.h*0.28,t.h*0.38]].forEach(([,cy,r])=>{
+      cx.fillStyle='#1c4a16';
+      cx.beginPath();cx.moveTo(tx,GY-tH-cy-r*1.7);cx.lineTo(tx-r,GY-tH-cy);cx.lineTo(tx+r,GY-tH-cy);cx.closePath();cx.fill();
+    });
+    cx.fillStyle='#142e10';
+    cx.beginPath();cx.moveTo(tx,GY-tH-t.h*0.92);cx.lineTo(tx-t.h*0.14,GY-tH-t.h*0.56);cx.lineTo(tx+t.h*0.14,GY-tH-t.h*0.56);cx.closePath();cx.fill();
+  }
+}
+
+/* ── Llama ── */
+function fl(fcx,baseY,r,phase){
+  const f=Math.sin(Date.now()/170+phase)*5;
+  const g=cx.createRadialGradient(fcx,baseY-r,1,fcx,baseY,r);
+  g.addColorStop(0,'#ffe070');g.addColorStop(0.35,'#ff5a00');g.addColorStop(1,'rgba(160,0,0,0)');
+  cx.fillStyle=g;
+  cx.beginPath();
+  cx.moveTo(fcx-r,baseY);
+  cx.quadraticCurveTo(fcx-r*0.3,baseY-r*1.4,fcx+f,baseY-r*2.5);
+  cx.quadraticCurveTo(fcx+r*0.3,baseY-r*1.4,fcx+r,baseY);
+  cx.closePath();cx.fill();
+}
+
+/* ── Roca (grande + piedrita) ── */
+function drawRock(o){
+  const rx=o.x,ry=o.y,rw=o.w,rh=o.h;
+  cx.fillStyle='rgba(0,0,0,0.22)';
+  cx.beginPath();cx.ellipse(rx+rw/2+5,ry+rh+5,rw*0.44,7,0,0,Math.PI*2);cx.fill();
+
+  cx.fillStyle='#7c7870';
+  cx.beginPath();
+  cx.moveTo(rx+rw*0.12,ry+rh);
+  cx.lineTo(rx,ry+rh*0.55);
+  cx.lineTo(rx+rw*0.08,ry+rh*0.18);
+  cx.lineTo(rx+rw*0.38,ry);
+  cx.lineTo(rx+rw*0.80,ry+rh*0.06);
+  cx.lineTo(rx+rw,ry+rh*0.42);
+  cx.lineTo(rx+rw*0.9,ry+rh);
+  cx.closePath();cx.fill();
+
+  cx.fillStyle='#5e5a54';
+  cx.beginPath();
+  cx.moveTo(rx+rw*0.80,ry+rh*0.06);
+  cx.lineTo(rx+rw,ry+rh*0.42);
+  cx.lineTo(rx+rw*0.9,ry+rh);
+  cx.lineTo(rx+rw*0.58,ry+rh);
+  cx.lineTo(rx+rw*0.48,ry+rh*0.5);
+  cx.closePath();cx.fill();
+
+  cx.fillStyle='rgba(210,205,195,0.42)';
+  cx.beginPath();cx.ellipse(rx+rw*0.3,ry+rh*0.26,rw*0.14,rh*0.1,-0.4,0,Math.PI*2);cx.fill();
+
+  /* piedrita */
+  const sx=rx+rw*0.66,sy=ry+rh+4,sr=10;
+  cx.fillStyle='#706c64';
+  cx.beginPath();cx.ellipse(sx,sy,sr,sr*0.62,0.2,0,Math.PI*2);cx.fill();
+  cx.fillStyle='#8c887e';
+  cx.beginPath();cx.ellipse(sx-2,sy-2,sr*0.34,sr*0.22,-0.3,0,Math.PI*2);cx.fill();
+}
+
+/* ── Frente de fuego ── */
+function drawFire(){
+  /* cortina de humo */
+  const smk=cx.createLinearGradient(fire.x-fire.w*3,0,fire.x+fire.w,0);
+  smk.addColorStop(0,'rgba(15,5,0,0.75)');smk.addColorStop(1,'rgba(50,18,0,0)');
+  cx.fillStyle=smk;cx.fillRect(fire.x-fire.w*3,0,fire.w*4,H);
+
+  /* pared de fuego vertical */
+  const fw=cx.createLinearGradient(fire.x-8,0,fire.x+fire.w+8,0);
+  fw.addColorStop(0,'rgba(255,50,0,0.75)');fw.addColorStop(1,'rgba(255,120,0,0)');
+  cx.fillStyle=fw;cx.fillRect(fire.x-8,0,fire.w+8,H);
+
+  fl(fire.x+fire.w*0.5,GY,fire.w*0.85,0);
+  fl(fire.x+fire.w*0.15,GY,fire.w*0.55,1.3);
+  fl(fire.x+fire.w*0.82,GY,fire.w*0.48,2.5);
+  fl(fire.x+fire.w*0.5,H*0.3,fire.w*0.4,0.7);
+}
+
+/* ── Bombero (imagen1) ── */
+function drawFirefighter(){
+  const {x,y,w,h,cr}=pl;
+  const hcx=x+w/2;
+  const t=Date.now();
+
+  if(cr){
+    cx.fillStyle='#cc2000';cx.fillRect(x+3,y+8,w-6,h-10);
+    cx.fillStyle='#aa1800';cx.fillRect(x+3,y+8,w-6,8);
+    drawHead(hcx,y+5,14,true);
+  }else{
+    /* piernas */
+    const ls=Math.sin(t/125)*10;
+    cx.fillStyle='#aa1800';
+    cx.fillRect(hcx-13,y+h-22,11,22+ls);
+    cx.fillRect(hcx+2,y+h-22,11,22-ls);
+    /* botas */
+    cx.fillStyle='#301808';
+    cx.fillRect(hcx-15,y+h+ls,14,7);
+    cx.fillRect(hcx+1,y+h-ls,14,7);
+    /* cuerpo */
+    cx.fillStyle='#cc2000';cx.fillRect(x+3,y+18,w-6,h-36);
+    /* línea amarilla */
+    cx.fillStyle='#ffcc00';cx.fillRect(hcx-2,y+20,4,h-40);
+    /* cinturón */
+    cx.fillStyle='#1a1a1a';cx.fillRect(x+3,y+h-28,w-6,7);
+    cx.fillStyle='#b0b0b0';cx.fillRect(hcx-6,y+h-28,12,7);
+    /* brazos animados */
+    const as=Math.sin(t/125)*8;
+    cx.strokeStyle='#cc2000';cx.lineWidth=10;cx.lineCap='round';
+    cx.beginPath();cx.moveTo(x+5,y+22);cx.lineTo(x-6,y+38+as);cx.stroke();
+    cx.beginPath();cx.moveTo(x+w-5,y+22);cx.lineTo(x+w+6,y+38-as);cx.stroke();
+    cx.fillStyle='#e8b060';cx.beginPath();cx.arc(x+w+6,y+38-as,7,0,Math.PI*2);cx.fill();
+    drawHead(hcx,y+13,15,false);
+  }
+}
+function drawHead(hx,hy,r,cr){
+  cx.fillStyle='#e8b060';cx.beginPath();cx.arc(hx,hy,r,0,Math.PI*2);cx.fill();
+  cx.fillStyle='#5a2e0e';
+  cx.beginPath();cx.ellipse(hx,hy+r*0.3,r*0.56,r*0.24,0,0,Math.PI);cx.fill();
+  cx.fillStyle='#2a1800';
+  cx.beginPath();cx.arc(hx-r*0.36,hy-r*0.14,2,0,Math.PI*2);cx.fill();
+  cx.beginPath();cx.arc(hx+r*0.36,hy-r*0.14,2,0,Math.PI*2);cx.fill();
+  cx.fillStyle='#cc1a00';
+  cx.beginPath();cx.arc(hx,hy-r*0.18,r*1.12,Math.PI,0);cx.fill();
+  cx.fillRect(hx-r*1.25,hy-r*0.18,r*2.5,r*0.38);
+  cx.fillStyle='#ffcc00';cx.font=`bold ${Math.round(r*0.7)}px Georgia`;cx.textAlign='center';
+  cx.fillText('★',hx,hy-r*0.5);cx.textAlign='left';
+}
+
+/* ── Manguera en la meta ── */
+function drawHose(){
+  const mx=goalX;
+  muzzA++;
+  cx.fillStyle='#b0b0a0';cx.fillRect(mx+16,GY-160,12,160);
+  cx.strokeStyle='#dd4408';cx.lineWidth=8;cx.lineCap='round';
+  cx.beginPath();cx.moveTo(mx+22,GY-120);cx.quadraticCurveTo(mx+80,GY-90,mx+130,GY-50);cx.stroke();
+  cx.fillStyle='#909090';cx.fillRect(mx+126,GY-56,16,12);
+  for(let i=0;i<12;i++){
+    const wx=mx+142+i*16;
+    const wy=GY-50-Math.sin(0.5+i*0.18)*i*12;
+    const al=Math.max(0,1-i/12);
+    cx.fillStyle=`rgba(60,150,255,${al*0.85})`;
+    cx.beginPath();cx.arc(wx,wy,6-i*0.38,0,Math.PI*2);cx.fill();
+  }
+  for(let i=0;i<8;i++){
+    cx.fillStyle=`rgba(160,210,255,${0.1+Math.sin(muzzA*0.05+i)*0.07})`;
+    cx.beginPath();cx.ellipse(mx+180+i*14,GY-30-i*6,16,10,0.3,0,Math.PI*2);cx.fill();
+  }
+  cx.fillStyle='#40e080';cx.font='bold 18px Georgia';cx.textAlign='center';
+  cx.fillText('¡Zona segura! 💧',mx+100,GY-170);cx.textAlign='left';
+}
+
+function drawCD(){
+  cx.fillStyle='rgba(8,3,0,.8)';cx.fillRect(0,0,W,H);
+  cx.fillStyle='#ff8c42';cx.font='bold 160px Georgia';cx.textAlign='center';
+  cx.shadowColor='#ff4400';cx.shadowBlur=60;
+  cx.fillText(cN>0?cN:'¡Ya!',W/2,H/2+54);
+  cx.shadowBlur=0;cx.textAlign='left';
+}
+
+function drawOverlay(bg,title,sub){
+  cx.fillStyle=bg+'d0';cx.fillRect(0,0,W,H);
+  cx.fillStyle='#fff8ee';cx.font='bold 52px Georgia';cx.textAlign='center';
+  cx.shadowColor='#000';cx.shadowBlur=20;
+  cx.fillText(title,W/2,H/2-30);
+  cx.fillStyle='#e8c080';cx.font='24px Georgia';
+  cx.fillText(sub,W/2,H/2+30);
+  cx.fillStyle='#ffa040';cx.font='18px Georgia';
+  cx.fillText('Clic o Enter para reintentar',W/2,H/2+80);
+  cx.shadowBlur=0;cx.textAlign='left';
+}
+
+function drawWin(){
+  drawHose();
+  cx.save();cx.translate(-cam.x,0);cx.restore();
+  cx.fillStyle='rgba(0,50,8,0.78)';cx.fillRect(0,0,W,H);
+  cx.fillStyle='#70ffaa';cx.font='bold 52px Georgia';cx.textAlign='center';
+  cx.shadowColor='#00ff60';cx.shadowBlur=30;
+  cx.fillText('¡Llegaste a la zona segura!',W/2,H/2-30);
+  cx.shadowBlur=0;
+  cx.fillStyle='#b0f0c8';cx.font='22px Georgia';
+  cx.fillText('Cuidemos los bosques nativos de la Patagonia.',W/2,H/2+24);
+  cx.fillStyle='#70e090';cx.font='17px Georgia';
+  cx.fillText('Clic o Enter para jugar de nuevo',W/2,H/2+72);
+  cx.textAlign='left';
+}
+
+last=performance.now();
+raf=requestAnimationFrame(loop);
+</script>
